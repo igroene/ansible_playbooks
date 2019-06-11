@@ -1,0 +1,153 @@
+# Run as follows (order doesn't matter):
+# ansible-playbook playbooks/backup_restore.yml --limit source.example.com,target.example.com
+---
+- hosts: all
+  vars_prompt:
+    - name: "source_server"
+      prompt: "Specify the source server"
+      private: no
+    - name: "target_server"
+      prompt: "Specify the target server (any existing data will be lost!)"
+      private: no
+    - name: "mysql_user"
+      prompt: "Specify a DB admin User"
+      private: yes
+      default: 'rebuild_user'
+    - name: "mysql_password"
+      prompt: "Specify the DB admin password"
+      private: yes
+
+  vars:
+    async_wait_time: 86400 
+    poll_interval: 5 
+    parallel_backup_threads: 2
+    mysql_datadir: '/var/lib/mysql'
+  gather_facts: False
+  become: yes
+  tasks:
+    - name: Schedule downtime in Nagios
+      nagios:
+        action: downtime
+        minutes: 30
+        service: mysql
+        host: '{{ ansible_hostname }}'
+      delegate_to: nagios.example.com
+
+    - name: Capture MySQL Data Dir
+      shell: "cat /etc/my.cnf | grep ^datadir | awk '{print $3}'"
+      changed_when: False
+      register: mysql_datadir_result
+
+    - set_fact:
+        mysql_datadir: "{{ mysql_datadir_result.stdout }}"
+
+    - name: Make sure source and target servers are defined
+      fail:
+        msg: "Source and Target server need to be defined in variables"
+      when: source_server == '' or target_server == ''
+
+    - name: Check if MySQL datadir {{ mysql_datadir }} was discovered correctly
+      fail:
+        msg: "MySQL datadir is blank.  Cannot continue!"
+      when: mysql_datadir == '' and inventory_hostname == target_server
+
+    - name: Stop MySQL Service
+      service:
+        name: mysql
+        state: stopped
+      when: inventory_hostname == target_server
+
+    - name: Clear {{ mysql_datadir }} on {{ target_server }}
+      shell: rm -rf {{ mysql_datadir }}/*
+      when: inventory_hostname == target_server
+
+    - name: Listen
+      shell: nc -dl 3306 | xbstream -x -C {{ mysql_datadir }}
+      become: yes
+      async: "{{ async_wait_time }}"
+      poll: 0
+      register: async_list_results
+      when: inventory_hostname == target_server
+
+    - name: Sleep to allow the Listen to start
+      pause:
+        seconds: 10
+
+    - set_fact: innoback_cmd="innobackupex --stream=xbstream --parallel=4 --user={{ mysql_user }} --password='{{ mysql_password }}' /tmp | nc {{ target_server }} 3306 > /tmp/xtrabackup_output.txt"
+      when: inventory_hostname == source_server
+
+    - name: Start Backup
+      shell: >
+        {{ innoback_cmd }}
+      become: yes
+      async: "{{ async_wait_time }}"
+      poll: 0
+      register: async_results
+      when: inventory_hostname == source_server
+
+    - name: Check if Backup is Complete
+      async_status:
+        jid: "{{ async_results.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 9000
+      delay: 60
+      when: inventory_hostname == source_server
+
+    - name: Start Apply Logs
+      shell: innobackupex --use-memory=12G --apply-log {{ mysql_datadir }}
+      async: "{{ async_wait_time }}"
+      poll: "{{ poll_interval }}"
+      when: inventory_hostname == target_server
+
+    - name: Update ownership on the files on {{ target_server }}
+      file:
+        path: "{{ mysql_datadir }}"
+        state: directory
+        recurse: yes
+        owner: mysql
+        group: mysql
+      when: inventory_hostname == target_server
+
+    - name: Start MySQL service on {{ target_server }}
+      shell: service mysql start
+      when: inventory_hostname == target_server
+
+    - name: Read position from xtrabackup file
+      shell: "cut -f1 /var/lib/mysql/xtrabackup_binlog_pos_innodb"
+      register: repl_log_file
+      when: inventory_hostname == target_server
+
+    - name: Read position
+      shell: "cut -f2 /var/lib/mysql/xtrabackup_binlog_pos_innodb"
+      register: repl_log_pos
+      when: inventory_hostname == target_server
+
+    - name: Configure replication
+      mysql_replication:
+        mode: changemaster
+        master_host: "{{ source_server }}"
+        master_log_file: "{{ repl_log_file.stdout }}"
+        master_log_pos: "{{ repl_log_pos.stdout }}"
+        master_user: "{{ repl_user }}"
+        master_password: "{{ repl_pass }}"
+        login_user: "{{ mysql_user }}"
+        login_password: "{{ mysql_password }}"
+      when: inventory_hostname == target_server
+
+    - name: start MySQL slave
+      mysql_replication:
+        mode: startslave
+      when: inventory_hostname == target_server
+
+    - name: Remove Xtrabackup files
+      file:
+        state: absent
+        path: "{{ mysql_datadir }}/{{ item }}"
+      with_items:
+        - xtrabackup_binlog_info
+        - xtrabackup_checkpoints
+        - xtrabackup_info
+        - xtrabackup_logfile
+        - xtrabackup_binlog_pos_innodb
+      when: inventory_hostname == target_server

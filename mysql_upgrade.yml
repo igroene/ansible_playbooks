@@ -1,0 +1,149 @@
+---
+- hosts: all
+  any_errors_fatal: yes
+  tasks:
+    - vars_prompt:
+      - name: username
+        prompt: "What is your username?"
+        private: no
+
+      - name: password
+        prompt: "What is your password?"
+
+    - name: verify cluster is healthy
+      shell: "/opt/tools/check_cluster.sh"
+      run_once: true
+      failed_when: health_result.rc == 0
+
+    - name: Capture Master Node
+      shell: "/opt/tools/get_master.sh"
+      changed_when: false
+      run_once: true
+      register: master_node_result
+      failed_when: master_node_result.stdout == ""
+
+    - set_fact:
+        master_node: "{{ master_node_result.stdout }}"
+
+    - name: get rid of removed parameters on my.cnf
+      lineinfile:
+        path: /etc/my.cnf
+        regexp: '^({{ item }})'
+        line: '#Removed for upgrade - \1'
+        backrefs: yes
+      with_items:
+        - old_passwords
+        - innodb_additional_mem_pool_size
+
+    - name: downtime alerts
+      shell: "/usr/local/bin/downtime.sh --host='{{ ansible_hostname }}' --service=\"{{ item }}\" --comment='Downtime services for Upgrade'"
+      with_items: [ 'Slave Lag', 'MySQL status' ]
+      delegate_to: nagios.example.com
+
+- hosts: all
+  serial: 1
+  any_errors_fatal: yes
+  tasks:
+    - name: Upgrade slaves
+      block:
+        - name: Take slave offline
+          become: yes
+          shell: "/opt/tools/offline_server.sh {{ ansible_hostname }}"
+
+        - name: stop MySQL
+          service:
+            name: mysql
+            state: stopped
+
+        - name: remove old packages
+          shell: "rpm -qa | grep Percona-Server | xargs rpm -e --nodeps"
+
+        - name: remove old xtrabackup
+          package:
+            name: percona-xtrabackup
+            state: absent
+
+        - name: Install MySQL 5.7
+          package:
+            name:
+              - Percona-Server-server-57
+              - Percona-Server-client-57
+              - Percona-Server-shared-57
+              - percona-xtrabackup-24
+            state: present
+
+        - name: start MySQL
+          service:
+            name: mysql
+          state: started
+
+        - name: run mysql_upgrade
+          shell: "mysql_upgrade -u{{ mysql_user }} -p{{ mysql_password }}"
+
+        - name: restart MySQL
+          service:
+            name: mysql
+            state: restarted
+
+      when: master_node != ansible_hostname
+
+- hosts: all
+  tasks:
+    - name: Upgrade master
+      block:
+        - name: Switch master
+          shell: "/opt/tools/switch --new-master=db2"
+
+        - name: Take old master offline
+          become: yes
+          shell: "/opt/tools/offline_server.sh {{ ansible_hostname }}"
+
+        - name: stop MySQL
+          service:
+            name: mysql
+            state: stopped
+
+        - name: remove old packages
+          shell: "rpm -qa | grep Percona-Server | xargs rpm -e --nodeps"
+
+        - name: remove old xtrabackup
+          package:
+            name: percona-xtrabackup
+            state: absent
+
+        - name: Install MySQL 5.7
+          package:
+            name:
+              - Percona-Server-server-57
+              - Percona-Server-client-57
+              - Percona-Server-shared-57
+              - percona-xtrabackup-24
+            state: present
+
+        - name: start MySQL
+          service:
+            name: mysql
+          state: started
+
+        - name: run mysql_upgrade
+          shell: "mysql_upgrade -u{{ mysql_user }} -p{{ mysql_password }}"
+
+        - name: restart MySQL
+          service:
+            name: mysql
+            state: restarted
+
+        - name: sleep for 60 s to give alerts time to recover
+            wait_for: timeout=60
+
+        - name: Ensure the cluster is healthy
+          shell: "/opt/tools/check_cluster.sh"
+          register: health_result
+          failed_when: health_result.rc == 0
+
+        - name: cancel downtime alerts
+          shell: "/usr/local/bin/downtime.sh --cancel --host='{{ ansible_hostname }}' --service=\"{{ item }}\" --comment='Downtime services for Upgrade'"
+          with_items: [ 'Slave Lag', 'MySQL status' ]
+          delegate_to: nagios.example.com
+
+      when: master_node == ansible_hostname
